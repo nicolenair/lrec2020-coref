@@ -1,0 +1,6 @@
+*checkpoints
+*scorers
+preds*
+logs*
+models*
+data*
