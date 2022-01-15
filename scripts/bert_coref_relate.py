@@ -4,23 +4,24 @@ from collections import Counter
 import sys
 import argparse
 import pandas as pd
+import itertools
 
 import pytorch_pretrained_bert
 from pytorch_pretrained_bert.modeling import BertPreTrainedModel, BertModel, BertConfig
 from pytorch_pretrained_bert import BertTokenizer
 from pytorch_pretrained_bert.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
-
+from transformers import (
+    BertTokenizer,
+    BertTokenizerFast,
+)
 import torch
 from torch import nn
-from bert_coref import LSTMTagger, read_conll, \
-    get_data, get_ant_labels, get_distance_bucket, \
-        get_inquote, get_matrix, get_mention_width_bucket, \
-        vec_get_distance_bucket
 import torch.optim as optim
 import numpy as np
 import random
 import calc_coref_metrics
 
+from bert_coref import LSTMTagger
 from torch.optim.lr_scheduler import ExponentialLR
 
 random.seed(1)
@@ -29,13 +30,33 @@ torch.manual_seed(1)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
+bert_dim = 768
+HIDDEN_DIM = 200
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def find_sublist(sub, bigger):
+    if not bigger:
+        return -1
+    if not sub:
+        return 0
+    first, rest = sub[0], sub[1:]
+    pos = 0
+    try:
+        while True:
+            pos = bigger.index(first, pos) + 1
+            if not rest or bigger[pos:pos+len(rest)] == rest:
+                return pos
+    except ValueError:
+        return -1
 
 class LSTMTaggerRelate(LSTMTagger):
     def __init__(self, config, freeze_bert=False):
         super(LSTMTaggerRelate, self).__init__(config)
         self.device = "cpu"
         self.predict_relationship_layer = nn.Linear(
-            self.hidden_dim * 2, self.hidden_dim * 2)
+            self.hidden_dim * 2, self.hidden_dim * 2
+        )
         self.relation_criterion = nn.CrossEntropyLoss()
         self.char_to_token = {}
         self.relation_maps = {}
@@ -43,18 +64,24 @@ class LSTMTaggerRelate(LSTMTagger):
         self.load_relation_maps()
 
     def load_relation_maps(self):
-        char_relations = pd.read_csv("data/character_relation_annotations.txt", sep='\t')
-        print(char_relations)
+        char_relations = pd.read_csv(
+            "data/character_relation_annotations.txt", sep="\t"
+        )
+        
         for m in range(len(char_relations)):
             self.relation_maps[
-                (char_relations.iloc[m]["character_1"], 
-                char_relations.iloc[m]["character_2"])] = char_relations.iloc[m]["fine_category"]
-        
-        self.annotated_characters = list(set(char_relations["character_1"] + char_relations["character_2"]))
-        self.char_to_token = {
-            k: v for v, k in enumerate(
-                self.annotated_characters)}
+                (
+                    char_relations.iloc[m]["character_1"],
+                    char_relations.iloc[m]["character_2"],
+                )
+            ] = char_relations.iloc[m]["fine_category"]
 
+        self.annotated_characters = list(
+            set(char_relations["character_1"]).union(set(char_relations["character_2"]))
+        )
+
+        # print("char relations", self.annotated_characters)
+        self.char_to_token = {k: v for v, k in enumerate(self.annotated_characters)}
 
     def extract_relation(self, a, b):
         if (a, b) in self.relation_maps:
@@ -64,27 +91,53 @@ class LSTMTaggerRelate(LSTMTagger):
         else:
             return None
 
-    def extract_pairs_from_assignments(self, set_of_assignments, input_ids):
-        set_of_assignments = [
-            i for i in set_of_assignments if i in 
-            self.annotated_characters]
+    def extract_pairs_from_assignments(
+            self, set_of_assignments, input_ids2, sents):
         all_pairs = []
         all_labels = []
 
-        #map indices to real characters
-        print(set_of_assignments)
+        # map indices to real characters
 
-        real_assignments = [None for i in range(len(set_of_assignments))]
-        for e, m in enumerate(set_of_assignments):
+        batch_word_set_of_assignments = []
+        batch_input_ids = []
+        
+        for b in sents:
+            word_set_of_assignments = []
+            input_ids = []
+            for k in b:
+                curr = 0
+                for y in k:
+                    input_ids.append(y)
+                    subwords = model.tokenizer.convert_tokens_to_ids(y)
+                    word_set_of_assignments.append(
+                        set_of_assignments[curr + 1])
+                    if type(subwords)==int:
+                        len_ = 1
+                    else:
+                        len_ = len(subwords)
+                    curr += len_
+            batch_word_set_of_assignments.append(word_set_of_assignments) 
+            batch_input_ids.append(input_ids)
+
+                
+
+        real_assignments = [None for i in range(len(word_set_of_assignments))]
+        
+
+        for e, input_ids in enumerate(batch_input_ids):
             for c in self.annotated_characters:
-                if m == c:
-                    cluster = set_of_assignments[e]
-                    real_assignments[real_assignments==cluster] = self.char_to_token[c]
+                join_str = "".join(input_ids)
+                i_m = re.search(c.lower(), join_str)
+                if i_m !=None:
+                    relev = join_str[i_m.start(): i_m.end()+1].split()
+                    ls_idx = find_sublist(relev, input_ids)
+                    cluster = word_set_of_assignments[ls_idx: len(relev)+1]
+                    real_assignments[real_assignments == cluster] = self.char_to_token[c]
         pairs = []
         labels = []
         for e, a in enumerate(real_assignments):
             for f, b in enumerate(real_assignments):
-                if a!=None and b!=None:
+                if a != None and b != None:
                     if a != b:
                         r = self.extract_relation(a, b)
                         if r != None:
@@ -93,29 +146,150 @@ class LSTMTaggerRelate(LSTMTagger):
 
         return pairs, labels
 
-    def relationship_loss(self, 
-            span_representation, 
-            set_of_assignments):
+    def relationship_loss(
+            self, sents, span_representation, set_of_assignments, input_ids):
         pairs, true_labels = self.extract_pairs_from_assignments(
-                    set_of_assignments, input_ids)
-        losses = 0
+            set_of_assignments, input_ids, sents
+        )
+        print("pairs: ", pairs)
+        print("true_labels: ", true_labels)
+        print("snets", sents)
+        losses = 0.0
         for (m, n), true_label in zip(pairs, true_labels):
             mention_representation = torch.cat(
-                [span_representation[m], span_representation[n]])
+                [span_representation[m], span_representation[n]]
+            )
             scores = self.predict_relationship_layer(mention_representation)
             prediction = torch.nn.functional.softmax(scores)
             loss = self.relation_criterion(prediction, true_label)
-            losses+=loss
-        return losses
-        # _, predicted = torch.max(outputs, 1)
+            losses += loss
+        return torch.tensor(losses, requires_grad=True)
 
-    def forward(self, matrix, index, truth=None, names=None, token_positions=None, starts=None, ends=None, widths=None, input_ids=None, attention_mask=None, transforms=None, quotes=None):
+    def get_mention_reps(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        starts=None,
+        ends=None,
+        index=None,
+        widths=None,
+        quotes=None,
+        matrix=None,
+        transforms=None,
+        doTrain=True,
+    ):
+
+        starts = starts.to(device)
+        ends = ends.to(device)
+        widths = widths.to(device)
+        quotes = quotes.to(device)
+
+        input_ids = input_ids.to(device)
+        attention_mask = attention_mask.to(device)
+        transforms = transforms.to(device)
+
+        # matrix specifies which token positions (cols) are associated with which mention spans (row)
+        matrix = matrix.to(device)  # num_sents x max_ents x max_words
+        #example: torch.Size([15, 4, 62])
+
+        # index specifies the location of the mentions in each sentence (which vary due to padding)
+        index = index.to(device)
+
+        sequence_outputs, pooled_outputs = self.bert(
+            input_ids, token_type_ids=None, attention_mask=attention_mask
+        )
+        #get bert embedding
+
+        all_layers = torch.cat(
+            (
+                sequence_outputs[-1],
+                sequence_outputs[-2],
+                sequence_outputs[-3],
+                sequence_outputs[-4],
+            ),
+            2,
+        )
+
+        embeds = torch.matmul(transforms, all_layers) #what transforms
+        # num_sents x max_words x 2 * hidden_dim
+        lstm_output, _ = self.lstm(embeds)
+        #pass it through lstm
+
+        ###########
+        # ATTENTION OVER MENTION
+        ###########
+
+        attention_weights = self.attention2(
+            self.tanh(self.attention1(lstm_output))
+        )  # num_sents x max_words x 1 #how much attention is paid to each token
+        attention_weights = torch.exp(attention_weights)
+
+        attx = attention_weights.squeeze(-1).unsqueeze(1).expand_as(matrix)
+
+        #after reshaping attention to match matrix (by token), this is just to 
+        #properly index the attention to the positions in the input
+        summer = attx * matrix 
+
+        val = matrix * summer  # num_sents x max_ents x max_words
+
+        val = val / torch.sum(1e-8 + val, dim=2).unsqueeze(-1)
+        #softmax
+        
+        #apply the attention
+        # num_sents x max_ents x 2 * hidden_dim
+        attended = torch.matmul(val, lstm_output)
+
+        attended = attended.view(-1, 2 * self.hidden_dim)
+
+        lstm_output = lstm_output.contiguous()
+        position_output = lstm_output.view(-1, 2 * self.hidden_dim)
+
+        # starts = token position of beginning of mention in flattened token list
+        start_output = torch.index_select(position_output, 0, starts)
+        # ends = token position of end of mention in flattened token list
+        end_output = torch.index_select(position_output, 0, ends)
+
+        # index = index of entity in flattened list of attended mention representations
+        # here, we are s
+        mentions = torch.index_select(attended, 0, index)
+        print("attended shape: ", attended.shape)
+        print("mentions shape: ", mentions.shape)
+
+        width_embeds = self.width_embeddings(widths)
+        quote_embeds = self.quote_embeddings(quotes)
+
+        span_representation = torch.cat(
+            (start_output, end_output, mentions, width_embeds, quote_embeds), 1
+        )
+
+        if doTrain:
+            return span_representation
+        else:
+            # detach tensor from computation graph at test time or memory will blow up
+            return span_representation.detach()
+
+    def forward(
+        self,
+        matrix,
+        index,
+        truth=None,
+        names=None,
+        token_positions=None,
+        starts=None,
+        ends=None,
+        widths=None,
+        input_ids=None,
+        attention_mask=None,
+        transforms=None,
+        quotes=None,
+        sents = None
+    ):
 
         doTrain = False
         if truth is not None:
             doTrain = True
 
-        zeroTensor = torch.FloatTensor([0]).to(self.device)
+        zeroTensor = torch.FloatTensor([0]).to(device)
 
         all_starts = None
         all_ends = None
@@ -125,8 +299,18 @@ class LSTMTaggerRelate(LSTMTagger):
         all_all = []
         for b in range(len(matrix)):
 
-            span_reps = self.get_mention_reps(input_ids=input_ids[b], attention_mask=attention_mask[b], starts=starts[b], ends=ends[b],
-                                              index=index[b], widths=widths[b], quotes=quotes[b], transforms=transforms[b], matrix=matrix[b], doTrain=doTrain)
+            span_reps = self.get_mention_reps(
+                input_ids=input_ids[b],
+                attention_mask=attention_mask[b],
+                starts=starts[b],
+                ends=ends[b],
+                index=index[b],
+                widths=widths[b],
+                quotes=quotes[b],
+                transforms=transforms[b],
+                matrix=matrix[b],
+                doTrain=doTrain,
+            )
             if b == 0:
                 span_representation = span_reps
                 all_starts = starts[b]
@@ -134,16 +318,15 @@ class LSTMTaggerRelate(LSTMTagger):
 
             else:
 
-                span_representation = torch.cat(
-                    (span_representation, span_reps), 0)
+                span_representation = torch.cat((span_representation, span_reps), 0)
 
                 all_starts = torch.cat((all_starts, starts[b]), 0)
                 all_ends = torch.cat((all_ends, ends[b]), 0)
 
-        all_starts = all_starts.to(self.device)
-        all_ends = all_ends.to(self.device)
+        all_starts = all_starts.to(device)
+        all_ends = all_ends.to(device)
 
-        num_mentions, = all_starts.shape
+        (num_mentions,) = all_starts.shape
 
         running_loss = 0
 
@@ -161,31 +344,52 @@ class LSTMTaggerRelate(LSTMTagger):
 
         mention_index = np.arange(num_mentions)
 
-        unary_scores = self.unary3(self.tanh(self.drop_layer_020(self.unary2(
-            self.tanh(self.drop_layer_020(self.unary1(span_representation)))))))
+        unary_scores = self.unary3(
+            self.tanh(
+                self.drop_layer_020(
+                    self.unary2(
+                        self.tanh(self.drop_layer_020(self.unary1(span_representation)))
+                    )
+                )
+            )
+        )
 
         for i in range(num_mentions):
 
             if i == 0:
                 # the first mention must start a new entity; this doesn't affect training (since the loss must be 0) so we can skip it.
-                # if truth is None:
+                if truth is None:
 
-                assignment = curid
-                curid += 1
-                assignments.append(assignment)
+                    assignment = curid
+                    curid += 1
+                    assignments.append(assignment)
 
                 continue
 
             MAX_PREVIOUS_MENTIONS = 300
 
             first = 0
-            # if truth is None or :
-            # if len(names[i]) == 1 and names[i][0].lower() in {"he", "his", "her", "she", "him", "they", "their", "them", "it", "himself", "its", "herself", "themselves"}:
-            #     MAX_PREVIOUS_MENTIONS = 20
+            if truth is None:
+                if len(names[i]) == 1 and names[i][0].lower() in {
+                    "he",
+                    "his",
+                    "her",
+                    "she",
+                    "him",
+                    "they",
+                    "their",
+                    "them",
+                    "it",
+                    "himself",
+                    "its",
+                    "herself",
+                    "themselves",
+                }:
+                    MAX_PREVIOUS_MENTIONS = 20
 
-            first = i-MAX_PREVIOUS_MENTIONS
-            if first < 0:
-                first = 0
+                first = i - MAX_PREVIOUS_MENTIONS
+                if first < 0:
+                    first = 0
 
             targets = span_representation[first:i]
             cp = span_representation[i].expand_as(targets)
@@ -194,36 +398,55 @@ class LSTMTaggerRelate(LSTMTagger):
             nesteds = []
 
             # get distance in mentions
-            distances = i-mention_index[first:i]
+            distances = i - mention_index[first:i]
             dists = vec_get_distance_bucket(distances)
-            dists = torch.LongTensor(dists).to(self.device)
+            dists = torch.LongTensor(dists).to(device)
             distance_embeds = self.distance_embeddings(dists)
 
             # get distance in sentences
-            sent_distances = token_positions[i]-token_positions[first:i]
+            sent_distances = token_positions[i] - token_positions[first:i]
             sent_dists = vec_get_distance_bucket(sent_distances)
-            sent_dists = torch.LongTensor(sent_dists).to(self.device)
+            sent_dists = torch.LongTensor(sent_dists).to(device)
             sent_distance_embeds = self.sent_distance_embeddings(sent_dists)
 
             # is the current mention nested within a previous one?
-            res1 = (all_starts[first:i] <= all_starts[i])
-            res2 = (all_ends[i] <= all_ends[first:i])
+            res1 = all_starts[first:i] <= all_starts[i]
+            res2 = all_ends[i] <= all_ends[first:i]
 
-            nesteds = (res1*res2).long()
+            nesteds = (res1 * res2).long()
             nesteds_embeds = self.nested_embeddings(nesteds)
 
-            res1 = (all_starts[i] <= all_starts[first:i])
-            res2 = (all_ends[first:i] <= all_ends[i])
+            res1 = all_starts[i] <= all_starts[first:i]
+            res2 = all_ends[first:i] <= all_ends[i]
 
-            nesteds = (res1*res2).long()
+            nesteds = (res1 * res2).long()
             nesteds_embeds2 = self.nested_embeddings(nesteds)
 
-            elementwise = cp*targets
-            concat = torch.cat((cp, targets, elementwise, distance_embeds,
-                                sent_distance_embeds, nesteds_embeds, nesteds_embeds2), 1)
+            elementwise = cp * targets
+            concat = torch.cat(
+                (
+                    cp,
+                    targets,
+                    elementwise,
+                    distance_embeds,
+                    sent_distance_embeds,
+                    nesteds_embeds,
+                    nesteds_embeds2,
+                ),
+                1,
+            )
 
-            preds = self.mention_mention3(self.tanh(self.drop_layer_020(self.mention_mention2(
-                self.tanh(self.drop_layer_020(self.mention_mention1(concat)))))))
+            preds = self.mention_mention3(
+                self.tanh(
+                    self.drop_layer_020(
+                        self.mention_mention2(
+                            self.tanh(
+                                self.drop_layer_020(self.mention_mention1(concat))
+                            )
+                        )
+                    )
+                )
+            )
 
             preds = preds + unary_scores[i] + unary_scores[first:i]
 
@@ -234,40 +457,22 @@ class LSTMTaggerRelate(LSTMTagger):
                 # zero is the score for the dummy antecedent/new entity
                 preds = torch.cat((preds, zeroTensor))
 
-                golds_sum = 0.
+                golds_sum = 0.0
                 preds_sum = torch.logsumexp(preds, 0)
 
                 if len(truth[i]) == 1 and truth[i][-1] not in seen:
-                    golds_sum = 0.
+                    golds_sum = 0.0
                     seen[truth[i][-1]] = 1
                 else:
                     golds = torch.index_select(
-                        preds, 0, torch.LongTensor(truth[i]).to(self.device))
+                        preds, 0, torch.LongTensor(truth[i]).to(device)
+                    )
                     golds_sum = torch.logsumexp(golds, 0)
 
                 # want to maximize (golds_sum-preds_sum), so minimize (preds_sum-golds_sum)
-                diff = preds_sum-golds_sum
+                diff = preds_sum - golds_sum
 
                 running_loss += diff
-
-                ########
-                arg_sorts = torch.argsort(preds, descending=True)
-                k = 0
-                while k < len(arg_sorts):
-                    cand_idx = arg_sorts[k]
-                    if preds[cand_idx] > 0:
-                        cand_assignment = assignments[cand_idx+first]
-                        assignment = cand_assignment
-                        ch += 1
-                        break
-
-                    else:
-                        assignment = curid
-                        curid += 1
-                        break
-
-                    k += 1
-                assignments.append(assignment)
 
             else:
 
@@ -284,7 +489,7 @@ class LSTMTaggerRelate(LSTMTagger):
                     while k < len(arg_sorts):
                         cand_idx = arg_sorts[k]
                         if preds[cand_idx] > 0:
-                            cand_assignment = assignments[cand_idx+first]
+                            cand_assignment = assignments[cand_idx + first]
                             assignment = cand_assignment
                             ch += 1
                             break
@@ -297,35 +502,678 @@ class LSTMTaggerRelate(LSTMTagger):
                         k += 1
                 assignments.append(assignment)
 
-
         if truth is not None:
-            relation_loss = self.relationship_loss( 
-                span_representation, 
-                assignments)
-                    
-            running_loss += relation_loss
             return running_loss
         else:
-            print(assignments)
-            return assignments
+            relation_loss = self.relationship_loss(
+                sents, span_representation, assignments, input_ids
+            )
+            return relation_loss
 
 
+def get_mention_width_bucket(dist):
+    if dist < 10:
+        return dist + 1
+
+    return 11
+
+
+def get_distance_bucket(dist):
+    if dist < 5:
+        return dist + 1
+
+    elif dist >= 5 and dist <= 7:
+        return 6
+    elif dist >= 8 and dist <= 15:
+        return 7
+    elif dist >= 16 and dist <= 31:
+        return 8
+    elif dist >= 32 and dist <= 63:
+        return 9
+
+    return 10
+
+
+vec_get_distance_bucket = np.vectorize(get_distance_bucket)
+
+
+def get_inquote(start, end, sent):
+
+    inQuote = False
+    quotes = []
+
+    for token in sent:
+        if token == "“" or token == '"':
+            if inQuote == True:
+                inQuote = False
+            else:
+                inQuote = True
+
+        quotes.append(inQuote)
+
+    for i in range(start, end + 1):
+        if quotes[i] == True:
+            return 1
+
+    return 0
+
+
+def print_conll(name, sents, all_ents, assignments, out):
+
+    doc_id, part_id = name
+
+    mapper = []
+    idd = 0
+    for ent in all_ents:
+        mapper_e = []
+        for e in ent:
+            mapper_e.append(idd)
+            idd += 1
+        mapper.append(mapper_e)
+
+    out.write("#begin document (%s); part %s\n" % (doc_id, part_id))
+
+    for s_idx, sent in enumerate(sents):
+        ents = all_ents[s_idx]
+        for w_idx, word in enumerate(sent):
+            if w_idx == 0 or w_idx == len(sent) - 1:
+                continue
+
+            label = []
+            for idx, (start, end) in enumerate(ents):
+                if start == w_idx and end == w_idx:
+                    eid = assignments[mapper[s_idx][idx]]
+                    label.append("(%s)" % eid)
+                elif start == w_idx:
+                    eid = assignments[mapper[s_idx][idx]]
+                    label.append("(%s" % eid)
+                elif end == w_idx:
+                    eid = assignments[mapper[s_idx][idx]]
+                    label.append("%s)" % eid)
+
+            out.write(
+                "%s\t%s\t%s\t%s\t_\t_\t_\t_\t_\t_\t_\t_\t%s\n"
+                % (doc_id, part_id, w_idx - 1, word, "|".join(label))
+            )
+
+        if len(sent) > 2:
+            out.write("\n")
+
+    out.write("#end document\n")
+
+
+def test(
+    model,
+    test_all_docs,
+    test_all_ents,
+    test_all_named_ents,
+    test_all_max_words,
+    test_all_max_ents,
+    test_doc_names,
+    outfile,
+    iterr,
+    goldFile,
+    path_to_scorer,
+    doTest=False,
+):
+
+    out = open(outfile, "w", encoding="utf-8")
+
+    # for each document
+    for idx in range(len(test_all_docs)):
+
+        d, p = test_doc_names[idx]
+        d = re.sub("/", "_", d)
+        test_doc = test_all_docs[idx]
+        test_ents = test_all_ents[idx]
+
+        max_words = test_all_max_words[idx]
+        max_ents = test_all_max_ents[idx]
+
+        names = []
+        for n_idx, sent in enumerate(test_ents):
+            for ent in sent:
+                name = test_doc[n_idx][ent[0] : ent[1] + 1]
+                names.append(name)
+
+        named_index = {}
+        for sidx, sentence in enumerate(test_all_named_ents[idx]):
+            for start, end, _ in sentence:
+                named_index[(sidx, start, end)] = 1
+
+        is_named = []
+
+        for sidx, sentence in enumerate(test_all_ents[idx]):
+            for (start, end) in sentence:
+                if (sidx, start, end) in named_index:
+                    is_named.append(1)
+                else:
+                    is_named.append(0)
+
+        (
+            test_matrix,
+            test_index,
+            test_token_positions,
+            test_ent_spans,
+            test_starts,
+            test_ends,
+            test_widths,
+            test_data,
+            test_masks,
+            test_transforms,
+            test_quotes,
+            ent_span,
+        ) = get_data(model, test_doc, test_ents, max_ents, max_words)
+
+        assignments = model.forward(
+            test_matrix,
+            test_index,
+            names=names,
+            token_positions=test_token_positions,
+            starts=test_starts,
+            ends=test_ends,
+            widths=test_widths,
+            input_ids=test_data,
+            attention_mask=test_masks,
+            transforms=test_transforms,
+            quotes=test_quotes,
+            sents = ent_span,
+        )
+        print_conll(test_doc_names[idx], test_doc, test_ents, assignments, out)
+
+    out.close()
+
+    if doTest:
+        print("Goldfile: %s" % goldFile)
+        print("Predfile: %s" % outfile)
+
+        bcub_f, avg = calc_coref_metrics.get_conll(
+            path_to_scorer, gold=goldFile, preds=outfile
+        )
+        print("Iter %s, Average F1: %.3f, bcub F1: %s" % (iterr, avg, bcub_f))
+        sys.stdout.flush()
+        return avg
+
+
+def get_matrix(list_of_entities, max_words, max_ents):
+    matrix = np.zeros((max_ents, max_words))
+    for idx, (start, end) in enumerate(list_of_entities):
+        for i in range(start, end + 1):
+            matrix[idx, i] = 1
+    return matrix
+
+
+def get_data(model, doc, ents, max_ents, max_words, batchsize=10):
+
+    token_positions = []
+    ent_spans = []
+    persons = []
+    inquotes = []
+
+    batch_matrix = []
+    matrix = []
+
+    max_words_batch = []
+    max_ents_batch = []
+
+    max_w = 1
+    max_e = 1
+
+    sent_count = 0
+    for idx, sent in enumerate(doc):
+
+        if len(sent) > max_w:
+            max_w = len(sent)
+        if len(ents[idx]) > max_e:
+            max_e = len(ents[idx])
+
+        sent_count += 1
+
+        if sent_count == batchsize:
+            max_words_batch.append(max_w)
+            max_ents_batch.append(max_e)
+            sent_count = 0
+            max_w = 0
+            max_e = 0
+
+    if sent_count > 0:
+        max_words_batch.append(max_w)
+        max_ents_batch.append(max_e)
+
+    batch_count = 0
+    for idx, sent in enumerate(doc):
+        matrix.append(
+            get_matrix(
+                ents[idx], max_words_batch[batch_count], max_ents_batch[batch_count]
+            )
+        )
+
+        if len(matrix) == batchsize:
+            batch_matrix.append(torch.FloatTensor(matrix))
+            matrix = []
+            batch_count += 1
+
+    if len(matrix) > 0:
+        batch_matrix.append(torch.FloatTensor(matrix))
+
+    batch_index = []
+    batch_quotes = []
+
+    batch_ent_spans = []
+
+    index = []
+    abs_pos = 0
+    sent_count = 0
+
+    b = 0
+    for idx, sent in enumerate(ents):
+
+        for i in range(len(sent)):
+            index.append(sent_count * max_ents_batch[b] + i)
+            s, e = sent[i]
+            token_positions.append(idx)
+            ent_spans.append(e - s)
+            phrase = " ".join(doc[idx][s : e + 1])
+
+            inquotes.append(get_inquote(s, e, doc[idx]))
+
+        abs_pos += len(doc[idx])
+
+        sent_count += 1
+
+        if sent_count == batchsize:
+            batch_index.append(torch.LongTensor(index))
+            batch_quotes.append(torch.LongTensor(inquotes))
+            batch_ent_spans.append(ent_spans)
+
+            index = []
+            inquotes = []
+            ent_spans = []
+            sent_count = 0
+            b += 1
+
+    if sent_count > 0:
+        batch_index.append(torch.LongTensor(index))
+        batch_quotes.append(torch.LongTensor(inquotes))
+        batch_ent_spans.append(ent_spans)
+
+    all_masks = []
+    all_transforms = []
+    all_data = []
+    all_sentences = []
+
+    batch_masks = []
+    batch_transforms = []
+    batch_data = []
+    batch_sentences = []
+
+    # get ids and pad sentence
+    for sent in doc:
+        tok_ids = []
+        input_mask = []
+        transform = []
+
+        all_toks = []
+        n = 0
+        for idx, word in enumerate(sent):
+            toks = model.tokenizer.tokenize(word)
+            all_toks.append(toks)
+            n += len(toks)
+
+        cur = 0
+        for idx, word in enumerate(sent):
+
+            toks = all_toks[idx]
+            ind = list(np.zeros(n))
+            for j in range(cur, cur + len(toks)):
+                ind[j] = 1.0 / len(toks)
+            cur += len(toks)
+            transform.append(ind)
+
+            tok_id = model.tokenizer.convert_tokens_to_ids(toks)
+            
+            assert len(tok_id) == len(toks)
+            tok_ids.extend(tok_id)
+
+            input_mask.extend(np.ones(len(toks)))
+
+            token = word.lower()
+
+        all_sentences.append(sent)
+        all_masks.append(input_mask)
+        all_data.append(tok_ids)
+        all_transforms.append(transform)
+
+        if len(all_masks) == batchsize:
+            batch_masks.append(all_masks)
+            batch_data.append(all_data)
+            batch_transforms.append(all_transforms)
+            batch_sentences.append(all_sentences)
+
+            all_masks = []
+            all_data = []
+            all_transforms = []
+
+    if len(all_masks) > 0:
+        batch_masks.append(all_masks)
+        batch_data.append(all_data)
+        batch_transforms.append(all_transforms)
+        batch_sentences.append(all_sentences)
+
+    for b in range(len(batch_data)):
+
+        max_len = max([len(sent) for sent in batch_data[b]])
+
+        for j in range(len(batch_data[b])):
+
+            blen = len(batch_data[b][j])
+
+            for k in range(blen, max_len):
+                batch_data[b][j].append(0)
+                batch_masks[b][j].append(0)
+                for z in range(len(batch_transforms[b][j])):
+                    batch_transforms[b][j][z].append(0)
+
+            for k in range(len(batch_transforms[b][j]), max_words_batch[b]):
+                batch_transforms[b][j].append(np.zeros(max_len))
+
+        batch_data[b] = torch.LongTensor(batch_data[b])
+        batch_transforms[b] = torch.FloatTensor(batch_transforms[b])
+        batch_masks[b] = torch.FloatTensor(batch_masks[b])
+
+    tok_pos = 0
+    starts = []
+    ends = []
+    widths = []
+
+    batch_starts = []
+    batch_ends = []
+    batch_widths = []
+
+    sent_count = 0
+    b = 0
+    for idx, sent in enumerate(ents):
+
+        for i in range(len(sent)):
+
+            s, e = sent[i]
+
+            starts.append(tok_pos + s)
+            ends.append(tok_pos + e)
+            widths.append(get_mention_width_bucket(e - s))
+
+        sent_count += 1
+        tok_pos += max_words_batch[b]
+
+        if sent_count == batchsize:
+            batch_starts.append(torch.LongTensor(starts))
+            batch_ends.append(torch.LongTensor(ends))
+            batch_widths.append(torch.LongTensor(widths))
+
+            starts = []
+            ends = []
+            widths = []
+            tok_pos = 0
+            sent_count = 0
+            b += 1
+
+    if sent_count > 0:
+        batch_starts.append(torch.LongTensor(starts))
+        batch_ends.append(torch.LongTensor(ends))
+        batch_widths.append(torch.LongTensor(widths))
+
+    return (
+        batch_matrix,
+        batch_index,
+        token_positions,
+        ent_spans,
+        batch_starts,
+        batch_ends,
+        batch_widths,
+        batch_data, #ids
+        batch_masks,
+        batch_transforms,
+        batch_quotes,
+        batch_sentences
+    )
+
+
+def get_ant_labels(all_doc_sents, all_doc_ents):
+
+    max_words = 0
+    max_ents = 0
+    mention_id = 0
+
+    big_ents = {}
+
+    doc_antecedent_labels = []
+    big_doc_ents = []
+
+    for idx, sent in enumerate(all_doc_sents):
+        if len(sent) > max_words:
+            max_words = len(sent)
+
+        this_sent_ents = []
+        all_sent_ents = sorted(all_doc_ents[idx], key=lambda x: (x[0], x[1]))
+        if len(all_sent_ents) > max_ents:
+            max_ents = len(all_sent_ents)
+
+        for (w_idx_start, w_idx_end, eid) in all_sent_ents:
+
+            this_sent_ents.append((w_idx_start, w_idx_end))
+
+            coref = {}
+            if eid in big_ents:
+                coref = big_ents[eid]
+            else:
+                coref = {mention_id: 1}
+
+            vals = sorted(coref.keys())
+
+            if eid not in big_ents:
+                big_ents[eid] = {}
+
+            big_ents[eid][mention_id] = 1
+            mention_id += 1
+
+            doc_antecedent_labels.append(vals)
+
+        big_doc_ents.append(this_sent_ents)
+
+    return doc_antecedent_labels, big_doc_ents, max_words, max_ents
+
+
+def read_conll(filename, model=None):
+
+    docid = None
+    partID = None
+
+    # collection
+    all_sents = []
+    all_ents = []
+    all_antecedent_labels = []
+    all_max_words = []
+    all_max_ents = []
+    all_doc_names = []
+
+    all_named_ents = []
+
+    # for one doc
+    all_doc_sents = []
+    all_doc_ents = []
+    all_doc_named_ents = []
+
+    # for one sentence
+    sent = []
+    ents = []
+    sent.append("[SEP]")
+    sid = 0
+
+    named_ents = []
+    cur_tokens = 0
+    max_allowable_tokens = 400
+    cur_tid = 0
+    open_count = 0
+    with open(filename, encoding="utf-8") as file:
+        for line in file:
+            if line.startswith("#begin document"):
+
+                all_doc_ents = []
+                all_doc_sents = []
+
+                all_doc_named_ents = []
+
+                open_ents = {}
+                open_named_ents = {}
+
+                sid = 0
+                docid = None
+                matcher = re.match(
+                    "#begin document \((.*)\); part (.*)$", line.rstrip()
+                )
+                if matcher != None:
+                    docid = matcher.group(1)
+                    partID = matcher.group(2)
+
+                print(docid)
+
+            elif line.startswith("#end document"):
+
+                all_sents.append(all_doc_sents)
+
+                doc_antecedent_labels, big_ents, max_words, max_ents = get_ant_labels(
+                    all_doc_sents, all_doc_ents
+                )
+
+                all_ents.append(big_ents)
+
+                all_named_ents.append(all_doc_named_ents)
+
+                all_antecedent_labels.append(doc_antecedent_labels)
+                all_max_words.append(max_words + 1)
+                all_max_ents.append(max_ents + 1)
+
+                all_doc_names.append((docid, partID))
+
+            else:
+
+                parts = re.split("\s+", line.rstrip())
+                if len(parts) < 2 or (
+                    cur_tokens >= max_allowable_tokens and open_count == 0
+                ):
+
+                    sent.append("[CLS]")
+                    all_doc_sents.append(sent)
+                    ents = sorted(ents, key=lambda x: (x[0], x[1]))
+
+                    all_doc_ents.append(ents)
+
+                    all_doc_named_ents.append(named_ents)
+
+                    ents = []
+                    named_ents = []
+                    sent = []
+                    sent.append("[SEP]")
+                    sid += 1
+
+                    cur_tokens = 0
+
+                    cur_tid = 0
+
+                    if len(parts) < 2:
+                        continue
+
+                # +1 to account for initial [SEP]
+                tid = cur_tid + 1
+                token = parts[3]
+                coref = parts[-1].split("|")
+                b_toks = model.tokenizer.tokenize(token)
+                cur_tokens += len(b_toks)
+                cur_tid += 1
+
+                for c in coref:
+                    if c.startswith("(") and c.endswith(")"):
+                        c = re.sub("\(", "", c)
+                        c = int(re.sub("\)", "", c))
+
+                        ents.append((tid, tid, c))
+
+                    elif c.startswith("("):
+                        c = int(re.sub("\(", "", c))
+
+                        if c not in open_ents:
+                            open_ents[c] = []
+                        open_ents[c].append(tid)
+                        open_count += 1
+
+                    elif c.endswith(")"):
+                        c = int(re.sub("\)", "", c))
+
+                        assert c in open_ents
+
+                        start_tid = open_ents[c].pop()
+                        open_count -= 1
+
+                        ents.append((start_tid, tid, c))
+
+                ner = parts[10].split("|")
+
+                for c in ner:
+                    try:
+                        if c.startswith("(") and c.endswith(")"):
+                            c = re.sub("\(", "", c)
+                            c = int(re.sub("\)", "", c))
+
+                            named_ents.append((tid, tid, c))
+
+                        elif c.startswith("("):
+                            c = int(re.sub("\(", "", c))
+
+                            if c not in open_named_ents:
+                                open_named_ents[c] = []
+                            open_named_ents[c].append(tid)
+
+                        elif c.endswith(")"):
+                            c = int(re.sub("\)", "", c))
+
+                            assert c in open_named_ents
+
+                            start_tid = open_named_ents[c].pop()
+
+                            named_ents.append((start_tid, tid, c))
+                    except:
+                        pass
+
+                sent.append(token)
+
+    return (
+        all_sents,
+        all_ents,
+        all_named_ents,
+        all_antecedent_labels,
+        all_max_words,
+        all_max_ents,
+        all_doc_names,
+    )
 
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('-t', '--trainData',
-                        help='Folder containing train data', required=False)
-    parser.add_argument('-v', '--valData',
-                        help='Folder containing test data', required=False)
     parser.add_argument(
-        '-m', '--mode', help='mode {train, predict}', required=False)
+        "-t", "--trainData", help="Folder containing train data", required=False
+    )
     parser.add_argument(
-        '-w', '--model', help='modelFile (to write to or read from)', required=False)
-    parser.add_argument('-o', '--outFile', help='outFile', required=False)
-    parser.add_argument('-s', '--path_to_scorer',
-                        help='Path to coreference scorer', required=False)
+        "-v", "--valData", help="Folder containing test data", required=False
+    )
+    parser.add_argument("-m", "--mode", help="mode {train, predict}", required=False)
+    parser.add_argument(
+        "-w", "--model", help="modelFile (to write to or read from)", required=False
+    )
+    parser.add_argument("-o", "--outFile", help="outFile", required=False)
+    parser.add_argument(
+        "-s", "--path_to_scorer", help="Path to coreference scorer", required=False
+    )
 
     args = vars(parser.parse_args())
 
@@ -334,31 +1182,53 @@ if __name__ == "__main__":
     valData = args["valData"]
     outfile = args["outFile"]
     path_to_scorer = args["path_to_scorer"]
-    
-    model = LSTMTaggerRelate.from_pretrained('bert-base-cased', freeze_bert=True)
 
-    # import sys
-    # sys.exit()
-    
-    config = BertConfig(vocab_size_or_config_json_file=32000, hidden_size=768,
-                        num_hidden_layers=12, num_attention_heads=12, intermediate_size=3072)
+    cache_dir = os.path.join(
+        str(PYTORCH_PRETRAINED_BERT_CACHE), "distributed_{}".format(0)
+    )
 
-    model.to("cpu")
+    model = LSTMTaggerRelate.from_pretrained(
+        "bert-base-cased", cache_dir=cache_dir, freeze_bert=True
+    )
+    config = BertConfig(
+        vocab_size_or_config_json_file=32000,
+        hidden_size=768,
+        num_hidden_layers=12,
+        num_attention_heads=12,
+        intermediate_size=3072,
+    )
 
+    model.to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     lr_scheduler = ExponentialLR(optimizer, gamma=0.999)
 
     if mode == "train":
-
+        model.load_state_dict(
+            torch.load("models/crossval/1.model", map_location=device), strict=False
+        )
         trainData = args["trainData"]
 
-        all_docs, all_ents, all_named_ents, all_truth, all_max_words, all_max_ents, doc_ids = read_conll(
-            trainData, model)
-        test_all_docs, test_all_ents, test_all_named_ents, test_all_truth, test_all_max_words, test_all_max_ents, test_doc_ids = read_conll(
-            valData, model)
+        (
+            all_docs,
+            all_ents,
+            all_named_ents,
+            all_truth,
+            all_max_words,
+            all_max_ents,
+            doc_ids,
+        ) = read_conll(trainData, model)
+        (
+            test_all_docs,
+            test_all_ents,
+            test_all_named_ents,
+            test_all_truth,
+            test_all_max_words,
+            test_all_max_ents,
+            test_doc_ids,
+        ) = read_conll(valData, model)
 
-        best_f1 = 0.
+        best_f1 = 0.0
         cur_steps = 0
 
         best_idx = 0
@@ -367,10 +1237,8 @@ if __name__ == "__main__":
         for i in range(100):
 
             model.train()
-            bigloss = 0.
+            bigloss = 0.0
             for idx in range(len(all_docs)):
-                # with open("ug.txt", "a+") as f:
-                #     f.write("ok")
 
                 if idx % 10 == 0:
                     print(idx, "/", len(all_docs))
@@ -378,13 +1246,61 @@ if __name__ == "__main__":
                 max_words = all_max_words[idx]
                 max_ents = all_max_ents[idx]
 
-                matrix, index, token_positions, ent_spans, starts, ends, widths, input_ids, masks, transforms, quotes = get_data(
-                    model, all_docs[idx], all_ents[idx], max_ents, max_words)
+                (
+                    matrix,
+                    index,
+                    token_positions,
+                    ent_spans,
+                    starts,
+                    ends,
+                    widths,
+                    input_ids,
+                    masks,
+                    transforms,
+                    quotes,
+                    batch_ent_span
+                ) = get_data(
+                    model,
+                    all_docs[idx],
+                    all_ents[idx],
+                    max_ents,
+                    max_words,
+                    batchsize=15,
+                )
+
+                # print("quotes", quotes)
 
                 if max_ents > 1:
                     model.zero_grad()
-                    loss = model.forward(matrix, index, truth=all_truth[idx], names=None, token_positions=token_positions, starts=starts,
-                                         ends=ends, widths=widths, input_ids=input_ids, attention_mask=masks, transforms=transforms, quotes=quotes)
+                    doc = all_docs[idx]
+                    ents = all_ents[idx]
+
+                    max_words = all_max_words[idx]
+                    max_ents = all_max_ents[idx]
+
+                    names = []
+                    for n_idx, sent in enumerate(ents):
+                        for ent in sent:
+                            name = doc[n_idx][ent[0] : ent[1] + 1]
+                            names.append(name)
+                    # loss = model.forward(matrix, index, truth=all_truth[idx], names=None, token_positions=token_positions, starts=starts,
+                    #                      ends=ends, widths=widths, input_ids=input_ids, attention_mask=masks, transforms=transforms, quotes=quotes)
+                    loss = model.forward(
+                        matrix,
+                        index,
+                        sents = batch_ent_span,
+                        truth=None,
+                        names=names,
+                        token_positions=token_positions,
+                        starts=starts,
+                        ends=ends,
+                        widths=widths,
+                        input_ids=input_ids,
+                        attention_mask=masks,
+                        transforms=transforms,
+                        quotes=quotes,
+                    )
+                    print("CHECK LOSS", loss)
                     loss.backward()
                     optimizer.step()
                     cur_steps += 1
@@ -392,35 +1308,53 @@ if __name__ == "__main__":
                         lr_scheduler.step()
                 bigloss += loss.item()
 
-            print(bigloss)
+            print("BIG LOSS", bigloss)
 
-            model.eval()
-            doTest = False
-            if i >= 2:
-                doTest = True
+            # model.eval()
+            # doTest = False
+            # if i >= 2:
+            #     doTest = True
 
-            avg_f1 = test(model, test_all_docs, test_all_ents, test_all_named_ents, test_all_max_words,
-                          test_all_max_ents, test_doc_ids, outfile, i, valData, path_to_scorer, doTest=doTest)
+            # avg_f1 = test(model, test_all_docs, test_all_ents, test_all_named_ents, test_all_max_words,
+            #               test_all_max_ents, test_doc_ids, outfile, i, valData, path_to_scorer, doTest=doTest)
 
+            # if doTest:
+            #     if avg_f1 > best_f1:
+            #         torch.save(model.state_dict(), modelFile)
+            #         print("Saving model ... %.3f is better than %.3f" %
+            #               (avg_f1, best_f1))
+            #         best_f1 = avg_f1
+            #         best_idx = i
 
-            if doTest:
-                if avg_f1 > best_f1:
-                    torch.save(model.state_dict(), modelFile)
-                    print("Saving model ... %.3f is better than %.3f" %
-                          (avg_f1, best_f1))
-                    best_f1 = avg_f1
-                    best_idx = i
-
-                if i-best_idx > patience:
-                    print("Stopping training at epoch %s" % i)
-                    break
+            #     if i-best_idx > patience:
+            #         print("Stopping training at epoch %s" % i)
+            #         break
 
     elif mode == "predict":
 
-        model.load_state_dict(torch.load(modelFile, map_location=self.device))
+        model.load_state_dict(torch.load(modelFile, map_location=device))
         model.eval()
-        test_all_docs, test_all_ents, test_all_named_ents, test_all_truth, test_all_max_words, test_all_max_ents, test_doc_ids = read_conll(
-            valData, model=model)
+        (
+            test_all_docs,
+            test_all_ents,
+            test_all_named_ents,
+            test_all_truth,
+            test_all_max_words,
+            test_all_max_ents,
+            test_doc_ids,
+        ) = read_conll(valData, model=model)
 
-        test(model, test_all_docs, test_all_ents, test_all_named_ents, test_all_max_words,
-             test_all_max_ents, test_doc_ids, outfile, 0, valData, path_to_scorer, doTest=True)
+        test(
+            model,
+            test_all_docs,
+            test_all_ents,
+            test_all_named_ents,
+            test_all_max_words,
+            test_all_max_ents,
+            test_doc_ids,
+            outfile,
+            0,
+            valData,
+            path_to_scorer,
+            doTest=True,
+        )
